@@ -1,0 +1,105 @@
+use axum::{
+    routing::{get, post},
+    Router, Extension,
+};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use sqlx::postgres::PgPoolOptions;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use dotenvy::dotenv;
+use dashmap::DashMap;
+use serde::{Serialize, Deserialize};
+use tower_http::cors::{Any, CorsLayer};
+
+mod auth;
+mod stocks;
+mod db;
+mod crypto;
+mod positions;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct StockQuote {
+    pub price: f64,
+    pub change: f64,
+    pub change_percent: f64,
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+}
+
+pub struct AppState {
+    pub db: sqlx::PgPool,
+    pub jwt_secret: String,
+    pub encryption_key: [u8; 32],
+    pub price_cache: DashMap<String, StockQuote>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenv().ok();
+
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+        ))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    // Database connection pool
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await?;
+
+    // Run migrations
+    sqlx::migrate!().run(&pool).await?;
+
+    // JWT Secret and Encryption Key from env
+    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let enc_key_str = std::env::var("ENCRYPTION_KEY").expect("ENCRYPTION_KEY must be set");
+    let mut encryption_key = [0u8; 32];
+    let key_bytes = enc_key_str.as_bytes();
+    for i in 0..32.min(key_bytes.len()) {
+        encryption_key[i] = key_bytes[i];
+    }
+
+    let state = Arc::new(AppState {
+        db: pool,
+        jwt_secret,
+        encryption_key,
+        price_cache: DashMap::new(),
+    });
+
+    // Background worker for real-time stock refresh (US.6)
+    let state_clone = Arc::clone(&state);
+    tokio::spawn(async move {
+        if let Err(e) = stocks::realtime_worker(state_clone).await {
+            tracing::error!("Real-time worker error: {}", e);
+        }
+    });
+
+    // CORS configuration
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    // Build our application with routes
+    let app = Router::new()
+        .route("/auth/register", post(auth::register))
+        .route("/auth/login", post(auth::login))
+        .route("/stocks/search", get(stocks::search))
+        .route("/watchlist", get(stocks::get_watchlist).post(stocks::add_to_watchlist))
+        .route("/watchlist/:symbol", axum::routing::delete(stocks::remove_from_watchlist))
+        .route("/positions", get(positions::get_positions).post(positions::add_position))
+        .layer(cors) // Add CORS layer
+        .layer(Extension(state));
+
+    // Run it
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    tracing::info!("listening on {}", addr);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
