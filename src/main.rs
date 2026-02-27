@@ -16,6 +16,7 @@ mod stocks;
 mod db;
 mod crypto;
 mod positions;
+mod db_setup;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StockQuote {
@@ -43,6 +44,11 @@ async fn main() -> anyhow::Result<()> {
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    // Ensure database exists (Pre-run check)
+    if let Err(e) = db_setup::ensure_db_exists().await {
+        tracing::warn!("Pre-run database check failed: {}. Attempting to proceed...", e);
+    }
 
     // Database connection pool
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
