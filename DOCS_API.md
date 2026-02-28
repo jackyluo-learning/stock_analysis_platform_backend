@@ -9,6 +9,16 @@ This documentation provides details for the backend API endpoints implemented in
 Most endpoints require a JSON Web Token (JWT) for authentication.
 - **Header:** `Authorization: Bearer <your_jwt_token>`
 
+## 0. System Endpoints
+
+### Health Check
+`GET /health`
+
+**Response (200 OK):**
+```text
+OK
+```
+
 ---
 
 ## 1. Authentication Endpoints

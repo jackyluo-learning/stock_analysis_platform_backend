@@ -5,11 +5,11 @@ use axum::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use sqlx::postgres::PgPoolOptions;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use dotenvy::dotenv;
 use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 
 mod auth;
 mod stocks;
@@ -17,6 +17,7 @@ mod db;
 mod crypto;
 mod positions;
 mod db_setup;
+mod logging;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StockQuote {
@@ -37,13 +38,10 @@ pub struct AppState {
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
 
-    // Initialize tracing
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        ))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    // Initialize industry-level structured logging
+    // The guard must be kept alive to ensure logs are flushed
+    let _log_guard = logging::init_tracing();
+    tracing::info!("Starting Stock Analysis Platform Backend...");
 
     // Ensure database exists (Pre-run check)
     if let Err(e) = db_setup::ensure_db_exists().await {
@@ -90,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Build our application with routes
+    // Build our application with routes and industry-standard tracing middleware
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/auth/register", post(auth::register))
@@ -99,12 +97,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/watchlist", get(stocks::get_watchlist).post(stocks::add_to_watchlist))
         .route("/watchlist/:symbol", axum::routing::delete(stocks::remove_from_watchlist))
         .route("/positions", get(positions::get_positions).post(positions::add_position))
+        .layer(TraceLayer::new_for_http()) // Detailed request/response tracing
         .layer(cors) // Add CORS layer
         .layer(Extension(state));
 
     // Run it
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    tracing::info!("listening on {}", addr);
+    tracing::info!("Server listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
