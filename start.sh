@@ -38,19 +38,13 @@ while ! nc -z localhost 3000; do
     fi
 done
 
-echo "--- Verification: Testing API Endpoints ---"
+echo "--- Verification: Testing Health Endpoint ---"
+HEALTH_RESP=$(curl -s http://localhost:3000/health)
 
-# 1. Test Stock Search (Read-only, public API)
-echo "Testing Stock Search (Public API)..."
-# Using a silent curl to just check the status code
-SEARCH_RESP=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:3000/stocks/search?q=AAPL")
-
-# Note: Yahoo Finance API might occasionally fail with 500, 
-# but a 200 or 500 both indicate the server route is active.
-if [ "$SEARCH_RESP" == "200" ] || [ "$SEARCH_RESP" == "500" ]; then
-    echo "SUCCESS: Stock Search API route is active (HTTP $SEARCH_RESP)."
+if [ "$HEALTH_RESP" == "OK" ]; then
+    echo "SUCCESS: Application is healthy (HTTP 200, Response: OK)."
 else
-    echo "FAILURE: Stock Search API returned unexpected HTTP $SEARCH_RESP."
+    echo "FAILURE: Health check failed. Response: $HEALTH_RESP"
 fi
 
 echo "--- Verification Complete ---"

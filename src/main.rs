@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build our application with routes
     let app = Router::new()
+        .route("/health", get(|| async { "OK" }))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/stocks/search", get(stocks::search))

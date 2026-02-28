@@ -30,14 +30,31 @@ pub async fn search(
     let url = format!("https://query2.finance.yahoo.com/v1/finance/search?q={}", params.q);
     let client = reqwest::Client::new();
     
-    let resp = match client.get(&url).send().await {
+    let resp = match client.get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+        .send()
+        .await {
         Ok(r) => r,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to contact Yahoo Finance").into_response(),
+        Err(e) => {
+            tracing::error!("Failed to contact Yahoo Finance: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to contact Yahoo Finance").into_response();
+        }
     };
 
-    match resp.json::<serde_json::Value>().await {
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("Failed to read Yahoo response body: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read Yahoo response").into_response();
+        }
+    };
+
+    match serde_json::from_str::<serde_json::Value>(&text) {
         Ok(json) => (StatusCode::OK, Json(json)).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse Yahoo response").into_response(),
+        Err(e) => {
+            tracing::error!("Failed to parse Yahoo response: {}. Body: {}", e, text);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse Yahoo response").into_response()
+        }
     }
 }
 
@@ -119,11 +136,9 @@ pub async fn remove_from_watchlist(
 }
 
 pub async fn realtime_worker(state: Arc<AppState>) -> anyhow::Result<()> {
-    let mut timer = interval(Duration::from_secs(2));
-    let connector = match yahoo::YahooConnector::new() {
-        Ok(c) => c,
-        Err(e) => return Err(anyhow::anyhow!("Connector error: {}", e)),
-    };
+    let mut timer = interval(Duration::from_secs(10));
+    let client = reqwest::Client::new();
+    let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36";
 
     loop {
         timer.tick().await;
@@ -139,21 +154,45 @@ pub async fn realtime_worker(state: Arc<AppState>) -> anyhow::Result<()> {
             };
 
         for row in symbols {
-            match connector.get_latest_quotes(&row.symbol, "1m").await {
-                Ok(resp) => {
-                    if let Ok(quotes) = resp.quotes() {
-                        if let Some(quote) = quotes.last() {
-                            let price = quote.close;
+            let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1m&range=1d", row.symbol);
+            
+            let resp = match client.get(&url)
+                .header("User-Agent", user_agent)
+                .send()
+                .await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("Worker failed to contact Yahoo for {}: {}", row.symbol, e);
+                    continue;
+                }
+            };
+
+            match resp.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    if let Some(result) = json["chart"]["result"].get(0) {
+                        let meta = &result["meta"];
+                        let price = meta["regularMarketPrice"].as_f64();
+                        let prev_close = meta["previousClose"].as_f64().or(meta["chartPreviousClose"].as_f64());
+
+                        if let Some(p) = price {
+                            let (change, change_percent) = if let Some(pc) = prev_close {
+                                let c = p - pc;
+                                let cp = (c / pc) * 100.0;
+                                (c, cp)
+                            } else {
+                                (0.0, 0.0)
+                            };
+
                             state.price_cache.insert(row.symbol.clone(), StockQuote {
-                                price,
-                                change: 0.0,
-                                change_percent: 0.0,
+                                price: p,
+                                change,
+                                change_percent,
                                 last_updated: chrono::Utc::now(),
                             });
                         }
                     }
                 }
-                Err(e) => tracing::error!("Error fetching quote for {}: {}", row.symbol, e),
+                Err(e) => tracing::error!("Worker failed to parse Yahoo response for {}: {}", row.symbol, e),
             }
         }
     }
