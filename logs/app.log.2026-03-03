@@ -1,0 +1,9 @@
+{"timestamp":"2026-03-03T00:43:30.566927Z","level":"INFO","fields":{"message":"Starting Stock Analysis Platform Backend..."},"target":"stock_analysis_platform_backend"}
+{"timestamp":"2026-03-03T00:43:30.567401Z","level":"INFO","fields":{"message":"Pre-run check: Connecting to PostgreSQL server at 100.70.163.64..."},"target":"stock_analysis_platform_backend::db_setup"}
+{"timestamp":"2026-03-03T00:43:44.521545Z","level":"INFO","fields":{"message":"Starting Stock Analysis Platform Backend..."},"target":"stock_analysis_platform_backend"}
+{"timestamp":"2026-03-03T00:43:44.522255Z","level":"INFO","fields":{"message":"Pre-run check: Connecting to PostgreSQL server at 100.70.163.64..."},"target":"stock_analysis_platform_backend::db_setup"}
+{"timestamp":"2026-03-03T00:44:51.509710Z","level":"INFO","fields":{"message":"Starting Stock Analysis Platform Backend..."},"target":"stock_analysis_platform_backend"}
+{"timestamp":"2026-03-03T00:44:51.510179Z","level":"INFO","fields":{"message":"Pre-run check: Connecting to PostgreSQL server at 100.70.163.64..."},"target":"stock_analysis_platform_backend::db_setup"}
+{"timestamp":"2026-03-03T00:44:51.646990Z","level":"INFO","fields":{"message":"Pre-run check: Database 'stock_platform' already exists."},"target":"stock_analysis_platform_backend::db_setup"}
+{"timestamp":"2026-03-03T00:44:51.936825Z","level":"INFO","fields":{"message":"relation \"_sqlx_migrations\" already exists, skipping"},"target":"sqlx::postgres::notice"}
+{"timestamp":"2026-03-03T00:44:52.061292Z","level":"INFO","fields":{"message":"Server listening on 0.0.0.0:3000"},"target":"stock_analysis_platform_backend"}

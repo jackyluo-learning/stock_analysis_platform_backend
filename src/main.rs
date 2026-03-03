@@ -32,6 +32,9 @@ pub struct AppState {
     pub jwt_secret: String,
     pub encryption_key: [u8; 32],
     pub price_cache: DashMap<String, StockQuote>,
+    pub alpaca_api_key: String,
+    pub alpaca_api_secret: String,
+    pub finnhub_api_key: String,
 }
 
 #[tokio::main]
@@ -67,11 +70,19 @@ async fn main() -> anyhow::Result<()> {
         encryption_key[i] = key_bytes[i];
     }
 
+    // API keys for market data providers
+    let alpaca_api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY must be set");
+    let alpaca_api_secret = std::env::var("ALPACA_API_SECRET").expect("ALPACA_API_SECRET must be set");
+    let finnhub_api_key = std::env::var("FINNHUB_API_KEY").expect("FINNHUB_API_KEY must be set");
+
     let state = Arc::new(AppState {
         db: pool,
         jwt_secret,
         encryption_key,
         price_cache: DashMap::new(),
+        alpaca_api_key,
+        alpaca_api_secret,
+        finnhub_api_key,
     });
 
     // Background worker for real-time stock refresh (US.6)

@@ -7,8 +7,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::{AppState, auth::AuthUser, StockQuote};
-use yahoo_finance_api as yahoo;
 use tokio::time::{interval, Duration};
+use dashmap::DashMap;
 
 #[derive(Deserialize)]
 pub struct SearchQuery {
@@ -24,38 +24,43 @@ pub struct WatchlistResponse {
 }
 
 pub async fn search(
+    Extension(state): Extension<Arc<AppState>>,
     Query(params): Query<SearchQuery>,
 ) -> impl IntoResponse {
-    // Manually implement search via Yahoo Finance API to avoid crate version mismatches
-    let url = format!("https://query2.finance.yahoo.com/v1/finance/search?q={}", params.q);
+    // Use Finnhub symbol search API
+    let url = format!(
+        "https://finnhub.io/api/v1/search?q={}&token={}",
+        params.q, state.finnhub_api_key
+    );
     let client = reqwest::Client::new();
-    
-    let resp = match client.get(&url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-        .send()
-        .await {
+
+    let resp = match client.get(&url).send().await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("Failed to contact Yahoo Finance: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to contact Yahoo Finance").into_response();
+            tracing::error!("Failed to contact Finnhub: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to contact Finnhub").into_response();
         }
     };
 
     let text = match resp.text().await {
         Ok(t) => t,
         Err(e) => {
-            tracing::error!("Failed to read Yahoo response body: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read Yahoo response").into_response();
+            tracing::error!("Failed to read Finnhub response body: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read Finnhub response").into_response();
         }
     };
 
-    match serde_json::from_str::<serde_json::Value>(&text) {
+    match parse_finnhub_search_response(&text) {
         Ok(json) => (StatusCode::OK, Json(json)).into_response(),
         Err(e) => {
-            tracing::error!("Failed to parse Yahoo response: {}. Body: {}", e, text);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse Yahoo response").into_response()
+            tracing::error!("Failed to parse Finnhub response: {}. Body: {}", e, text);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse Finnhub response").into_response()
         }
     }
+}
+
+pub fn parse_finnhub_search_response(text: &str) -> anyhow::Result<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(text).map_err(|e| anyhow::anyhow!(e))
 }
 
 pub async fn get_watchlist(
@@ -138,7 +143,6 @@ pub async fn remove_from_watchlist(
 pub async fn realtime_worker(state: Arc<AppState>) -> anyhow::Result<()> {
     let mut timer = interval(Duration::from_secs(10));
     let client = reqwest::Client::new();
-    let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36";
 
     loop {
         timer.tick().await;
@@ -153,47 +157,111 @@ pub async fn realtime_worker(state: Arc<AppState>) -> anyhow::Result<()> {
                 }
             };
 
-        for row in symbols {
-            let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1m&range=1d", row.symbol);
-            
-            let resp = match client.get(&url)
-                .header("User-Agent", user_agent)
-                .send()
-                .await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("Worker failed to contact Yahoo for {}: {}", row.symbol, e);
-                    continue;
-                }
-            };
+        if symbols.is_empty() {
+            continue;
+        }
 
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    if let Some(result) = json["chart"]["result"].get(0) {
-                        let meta = &result["meta"];
-                        let price = meta["regularMarketPrice"].as_f64();
-                        let prev_close = meta["previousClose"].as_f64().or(meta["chartPreviousClose"].as_f64());
+        // Build comma-separated symbol list for Alpaca batch snapshot
+        let symbol_list: Vec<&str> = symbols.iter().map(|r| r.symbol.as_str()).collect();
+        let symbols_param = symbol_list.join(",");
 
-                        if let Some(p) = price {
-                            let (change, change_percent) = if let Some(pc) = prev_close {
-                                let c = p - pc;
-                                let cp = (c / pc) * 100.0;
-                                (c, cp)
-                            } else {
-                                (0.0, 0.0)
-                            };
+        let url = format!(
+            "https://data.alpaca.markets/v2/stocks/snapshots?symbols={}&feed=iex",
+            symbols_param
+        );
 
-                            state.price_cache.insert(row.symbol.clone(), StockQuote {
-                                price: p,
-                                change,
-                                change_percent,
-                                last_updated: chrono::Utc::now(),
-                            });
-                        }
-                    }
-                }
-                Err(e) => tracing::error!("Worker failed to parse Yahoo response for {}: {}", row.symbol, e),
+        let resp = match client
+            .get(&url)
+            .header("APCA-API-KEY-ID", &state.alpaca_api_key)
+            .header("APCA-API-SECRET-KEY", &state.alpaca_api_secret)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Worker failed to contact Alpaca: {}", e);
+                continue;
+            }
+        };
+
+        match resp.json::<serde_json::Value>().await {
+            Ok(json) => {
+                process_alpaca_snapshots(&state.price_cache, json);
+            }
+            Err(e) => tracing::error!("Worker failed to parse Alpaca response: {}", e),
+        }
+    }
+}
+
+pub fn process_alpaca_snapshots(price_cache: &DashMap<String, StockQuote>, json: serde_json::Value) {
+    // Alpaca snapshot response is a map: { "AAPL": { ... }, "MSFT": { ... } }
+    if let Some(obj) = json.as_object() {
+        for (symbol, snapshot) in obj {
+            // latestTrade.p = latest trade price
+            let price = snapshot["latestTrade"]["p"].as_f64();
+            // dailyBar.o = today's open, prevDailyBar.c = previous close
+            let prev_close = snapshot["prevDailyBar"]["c"].as_f64();
+
+            if let Some(p) = price {
+                let (change, change_percent) = if let Some(pc) = prev_close {
+                    let c = p - pc;
+                    let cp = if pc != 0.0 { (c / pc) * 100.0 } else { 0.0 };
+                    (c, cp)
+                } else {
+                    (0.0, 0.0)
+                };
+
+                price_cache.insert(symbol.clone(), StockQuote {
+                    price: p,
+                    change,
+                    change_percent,
+                    last_updated: chrono::Utc::now(),
+                });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dashmap::DashMap;
+    use serde_json::json;
+
+    #[test]
+    fn test_process_alpaca_snapshots() {
+        let price_cache = DashMap::new();
+        let json = json!({
+            "AAPL": {
+                "latestTrade": { "p": 150.0 },
+                "prevDailyBar": { "c": 145.0 }
+            },
+            "MSFT": {
+                "latestTrade": { "p": 300.0 },
+                "prevDailyBar": { "c": 310.0 }
+            }
+        });
+
+        process_alpaca_snapshots(&price_cache, json);
+
+        assert_eq!(price_cache.len(), 2);
+        
+        let aapl = price_cache.get("AAPL").unwrap();
+        assert_eq!(aapl.price, 150.0);
+        assert_eq!(aapl.change, 5.0);
+        assert!((aapl.change_percent - 3.448).abs() < 0.001);
+
+        let msft = price_cache.get("MSFT").unwrap();
+        assert_eq!(msft.price, 300.0);
+        assert_eq!(msft.change, -10.0);
+        assert!((msft.change_percent - (-3.225)).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_finnhub_search_response() {
+        let body = r#"{"count":1,"result":[{"description":"APPLE INC","displaySymbol":"AAPL","symbol":"AAPL","type":"Common Stock"}]}"#;
+        let result = parse_finnhub_search_response(body).unwrap();
+        assert_eq!(result["count"], 1);
+        assert_eq!(result["result"][0]["symbol"], "AAPL");
     }
 }
