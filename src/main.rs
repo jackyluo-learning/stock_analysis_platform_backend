@@ -1,6 +1,6 @@
 use axum::{
     routing::{get, post},
-    Router, Extension,
+    Router,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,14 +10,17 @@ use dashmap::DashMap;
 use serde::{Serialize, Deserialize};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
+use tokio::signal;
 
 mod auth;
-mod stocks;
-mod db;
+mod config;
 mod crypto;
-mod positions;
+mod db;
 mod db_setup;
+mod error;
 mod logging;
+mod positions;
+mod stocks;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StockQuote {
@@ -27,14 +30,13 @@ pub struct StockQuote {
     pub last_updated: chrono::DateTime<chrono::Utc>,
 }
 
+/// Shared application state, accessible via Axum's `State` extractor.
 pub struct AppState {
     pub db: sqlx::PgPool,
-    pub jwt_secret: String,
+    pub config: config::AppConfig,
     pub encryption_key: [u8; 32],
     pub price_cache: DashMap<String, StockQuote>,
-    pub alpaca_api_key: String,
-    pub alpaca_api_secret: String,
-    pub finnhub_api_key: String,
+    pub http_client: reqwest::Client,
 }
 
 #[tokio::main]
@@ -42,9 +44,15 @@ async fn main() -> anyhow::Result<()> {
     dotenv().ok();
 
     // Initialize industry-level structured logging
-    // The guard must be kept alive to ensure logs are flushed
     let _log_guard = logging::init_tracing();
     tracing::info!("Starting Stock Analysis Platform Backend...");
+
+    // Load typed configuration from environment
+    let app_config = config::AppConfig::from_env()?;
+    tracing::info!("Configuration loaded successfully");
+
+    // Parse encryption key (supports hex or legacy UTF-8 fallback)
+    let encryption_key = app_config.parse_encryption_key()?;
 
     // Ensure database exists (Pre-run check)
     if let Err(e) = db_setup::ensure_db_exists().await {
@@ -52,40 +60,28 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Database connection pool
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+        .max_connections(app_config.server.max_db_connections)
+        .connect(&app_config.database_url)
         .await?;
 
     // Run migrations
     sqlx::migrate!().run(&pool).await?;
 
-    // JWT Secret and Encryption Key from env
-    let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
-    let enc_key_str = std::env::var("ENCRYPTION_KEY").expect("ENCRYPTION_KEY must be set");
-    let mut encryption_key = [0u8; 32];
-    let key_bytes = enc_key_str.as_bytes();
-    for i in 0..32.min(key_bytes.len()) {
-        encryption_key[i] = key_bytes[i];
-    }
-
-    // API keys for market data providers
-    let alpaca_api_key = std::env::var("ALPACA_API_KEY").expect("ALPACA_API_KEY must be set");
-    let alpaca_api_secret = std::env::var("ALPACA_API_SECRET").expect("ALPACA_API_SECRET must be set");
-    let finnhub_api_key = std::env::var("FINNHUB_API_KEY").expect("FINNHUB_API_KEY must be set");
+    // Shared HTTP client with connection pooling
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
 
     let state = Arc::new(AppState {
         db: pool,
-        jwt_secret,
+        config: app_config.clone(),
         encryption_key,
         price_cache: DashMap::new(),
-        alpaca_api_key,
-        alpaca_api_secret,
-        finnhub_api_key,
+        http_client,
     });
 
-    // Background worker for real-time stock refresh (US.6)
+    // Background worker for real-time stock refresh
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
         if let Err(e) = stocks::realtime_worker(state_clone).await {
@@ -99,24 +95,85 @@ async fn main() -> anyhow::Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Build our application with routes and industry-standard tracing middleware
+    // Build application with routes, State extractor, and tracing middleware
     let app = Router::new()
-        .route("/health", get(|| async { "OK" }))
+        .route("/health", get(health_check))
         .route("/auth/register", post(auth::register))
         .route("/auth/login", post(auth::login))
         .route("/stocks/search", get(stocks::search))
         .route("/watchlist", get(stocks::get_watchlist).post(stocks::add_to_watchlist))
         .route("/watchlist/:symbol", axum::routing::delete(stocks::remove_from_watchlist))
         .route("/positions", get(positions::get_positions).post(positions::add_position))
-        .layer(TraceLayer::new_for_http()) // Detailed request/response tracing
-        .layer(cors) // Add CORS layer
-        .layer(Extension(state));
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state);
 
-    // Run it
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
+    // Start server with graceful shutdown
+    let addr = SocketAddr::new(
+        app_config.server.host.parse()?,
+        app_config.server.port,
+    );
     tracing::info!("Server listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
+    tracing::info!("Server shut down gracefully");
     Ok(())
+}
+
+/// Enhanced health check that verifies database connectivity.
+async fn health_check(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::Json;
+
+    let db_ok = sqlx::query("SELECT 1")
+        .execute(&state.db)
+        .await
+        .is_ok();
+
+    let cache_size = state.price_cache.len();
+
+    if db_ok {
+        (StatusCode::OK, Json(serde_json::json!({
+            "status": "healthy",
+            "database": "connected",
+            "cache_entries": cache_size
+        }))).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "status": "unhealthy",
+            "database": "disconnected",
+            "cache_entries": cache_size
+        }))).into_response()
+    }
+}
+
+/// Listens for Ctrl+C or SIGTERM to trigger graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => { tracing::info!("Received Ctrl+C, shutting down..."); },
+        _ = terminate => { tracing::info!("Received SIGTERM, shutting down..."); },
+    }
 }

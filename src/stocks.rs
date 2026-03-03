@@ -1,12 +1,12 @@
 use axum::{
-    extract::{Json, Query, Path},
+    extract::{Json, Query, Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Extension,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::{AppState, auth::AuthUser, StockQuote};
+use crate::error::AppError;
 use tokio::time::{interval, Duration};
 use dashmap::DashMap;
 
@@ -24,39 +24,30 @@ pub struct WatchlistResponse {
 }
 
 pub async fn search(
-    Extension(state): Extension<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQuery>,
-) -> impl IntoResponse {
-    // Use Finnhub symbol search API
+) -> Result<impl IntoResponse, AppError> {
     let url = format!(
         "https://finnhub.io/api/v1/search?q={}&token={}",
-        params.q, state.finnhub_api_key
+        params.q, state.config.finnhub.api_key
     );
-    let client = reqwest::Client::new();
 
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to contact Finnhub: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to contact Finnhub").into_response();
-        }
-    };
+    let text = state.http_client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppError::ExternalApi(format!("Failed to contact Finnhub: {}", e)))?
+        .text()
+        .await
+        .map_err(|e| AppError::ExternalApi(format!("Failed to read Finnhub response: {}", e)))?;
 
-    let text = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("Failed to read Finnhub response body: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to read Finnhub response").into_response();
-        }
-    };
-
-    match parse_finnhub_search_response(&text) {
-        Ok(json) => (StatusCode::OK, Json(json)).into_response(),
-        Err(e) => {
+    let json = parse_finnhub_search_response(&text)
+        .map_err(|e| {
             tracing::error!("Failed to parse Finnhub response: {}. Body: {}", e, text);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to parse Finnhub response").into_response()
-        }
-    }
+            AppError::ExternalApi("Failed to parse Finnhub response".into())
+        })?;
+
+    Ok((StatusCode::OK, Json(json)))
 }
 
 pub fn parse_finnhub_search_response(text: &str) -> anyhow::Result<serde_json::Value> {
@@ -64,32 +55,30 @@ pub fn parse_finnhub_search_response(text: &str) -> anyhow::Result<serde_json::V
 }
 
 pub async fn get_watchlist(
-    Extension(state): Extension<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     user: AuthUser,
-) -> impl IntoResponse {
-    let symbols = sqlx::query_as::<_, WatchlistRow>(
+) -> Result<impl IntoResponse, AppError> {
+    let rows = sqlx::query_as::<_, WatchlistRow>(
         "SELECT symbol FROM watchlist WHERE user_id = $1"
     )
     .bind(user.id)
     .fetch_all(&state.db)
-    .await;
+    .await?;
 
-    match symbols {
-        Ok(rows) => {
-            let mut response = Vec::new();
-            for row in rows {
-                let quote = state.price_cache.get(&row.symbol).map(|q| q.clone());
-                response.push(WatchlistResponse {
-                    symbol: row.symbol,
-                    price: quote.as_ref().map(|q| q.price),
-                    change: quote.as_ref().map(|q| q.change),
-                    change_percent: quote.as_ref().map(|q| q.change_percent),
-                });
+    let response: Vec<WatchlistResponse> = rows
+        .into_iter()
+        .map(|row| {
+            let quote = state.price_cache.get(&row.symbol).map(|q| q.clone());
+            WatchlistResponse {
+                symbol: row.symbol,
+                price: quote.as_ref().map(|q| q.price),
+                change: quote.as_ref().map(|q| q.change),
+                change_percent: quote.as_ref().map(|q| q.change_percent),
             }
-            (StatusCode::OK, Json(response)).into_response()
-        }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
-    }
+        })
+        .collect();
+
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[derive(sqlx::FromRow)]
@@ -103,46 +92,39 @@ pub struct AddToWatchlistRequest {
 }
 
 pub async fn add_to_watchlist(
-    Extension(state): Extension<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     user: AuthUser,
     Json(payload): Json<AddToWatchlistRequest>,
-) -> impl IntoResponse {
-    let result = sqlx::query(
+) -> Result<impl IntoResponse, AppError> {
+    sqlx::query(
         "INSERT INTO watchlist (user_id, symbol) VALUES ($1, $2) ON CONFLICT DO NOTHING"
     )
     .bind(user.id)
-    .bind(payload.symbol)
+    .bind(&payload.symbol)
     .execute(&state.db)
-    .await;
+    .await?;
 
-    match result {
-        Ok(_) => StatusCode::CREATED.into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
-    }
+    Ok(StatusCode::CREATED)
 }
 
 pub async fn remove_from_watchlist(
-    Extension(state): Extension<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     user: AuthUser,
     Path(symbol): Path<String>,
-) -> impl IntoResponse {
-    let result = sqlx::query(
+) -> Result<impl IntoResponse, AppError> {
+    sqlx::query(
         "DELETE FROM watchlist WHERE user_id = $1 AND symbol = $2"
     )
     .bind(user.id)
-    .bind(symbol)
+    .bind(&symbol)
     .execute(&state.db)
-    .await;
+    .await?;
 
-    match result {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
-    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn realtime_worker(state: Arc<AppState>) -> anyhow::Result<()> {
     let mut timer = interval(Duration::from_secs(10));
-    let client = reqwest::Client::new();
 
     loop {
         timer.tick().await;
@@ -170,10 +152,10 @@ pub async fn realtime_worker(state: Arc<AppState>) -> anyhow::Result<()> {
             symbols_param
         );
 
-        let resp = match client
+        let resp = match state.http_client
             .get(&url)
-            .header("APCA-API-KEY-ID", &state.alpaca_api_key)
-            .header("APCA-API-SECRET-KEY", &state.alpaca_api_secret)
+            .header("APCA-API-KEY-ID", &state.config.alpaca.api_key)
+            .header("APCA-API-SECRET-KEY", &state.config.alpaca.api_secret)
             .send()
             .await
         {

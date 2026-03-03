@@ -1,14 +1,15 @@
 use axum::{
-    extract::{Json, FromRequestParts},
+    extract::{Json, State, FromRequestParts},
     http::{StatusCode, request::Parts},
     response::IntoResponse,
-    Extension, async_trait,
+    async_trait,
 };
 use bcrypt::{hash, verify, DEFAULT_COST};
 use jsonwebtoken::{encode, decode, Header, EncodingKey, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::AppState;
+use crate::error::AppError;
 use uuid::Uuid;
 use chrono::{Utc, Duration};
 
@@ -18,34 +19,30 @@ pub struct AuthUser {
 }
 
 #[async_trait]
-impl<S> FromRequestParts<S> for AuthUser
-where
-    S: Send + Sync,
-{
-    type Rejection = StatusCode;
+impl FromRequestParts<Arc<AppState>> for AuthUser {
+    type Rejection = AppError;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        let Extension(state): Extension<Arc<AppState>> = Extension::from_request_parts(parts, _state)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
         let auth_header = parts
             .headers
             .get("Authorization")
             .and_then(|h| h.to_str().ok())
-            .ok_or(StatusCode::UNAUTHORIZED)?;
+            .ok_or_else(|| AppError::Unauthorized("Missing Authorization header".into()))?;
 
         if !auth_header.starts_with("Bearer ") {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(AppError::Unauthorized("Invalid Authorization header format".into()));
         }
 
         let token = &auth_header[7..];
         let token_data = decode::<Claims>(
             token,
-            &DecodingKey::from_secret(state.jwt_secret.as_ref()),
+            &DecodingKey::from_secret(state.config.jwt_secret.as_ref()),
             &Validation::default(),
         )
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+        .map_err(|_| AppError::Unauthorized("Invalid or expired token".into()))?;
 
         Ok(AuthUser { id: token_data.claims.sub })
     }
@@ -70,53 +67,51 @@ pub struct AuthResponse {
 }
 
 pub async fn register(
-    Extension(state): Extension<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<RegisterRequest>,
-) -> impl IntoResponse {
-    let password_hash = match hash(payload.password, DEFAULT_COST) {
-        Ok(h) => h,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error hashing password").into_response(),
-    };
+) -> Result<impl IntoResponse, AppError> {
+    let password_hash = hash(payload.password, DEFAULT_COST)
+        .map_err(|e| AppError::Internal(format!("Error hashing password: {}", e)))?;
 
-    let result = sqlx::query(
+    sqlx::query(
         "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)"
     )
-    .bind(payload.username)
-    .bind(payload.email)
-    .bind(password_hash)
+    .bind(&payload.username)
+    .bind(&payload.email)
+    .bind(&password_hash)
     .execute(&state.db)
-    .await;
-
-    match result {
-        Ok(_) => (StatusCode::CREATED, "User registered").into_response(),
-        Err(e) => {
-            tracing::error!("Registration error: {}", e);
-            (StatusCode::BAD_REQUEST, "User already exists or database error").into_response()
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref db_err) if db_err.is_unique_violation() => {
+            AppError::BadRequest("User already exists".into())
         }
-    }
+        _ => AppError::Database(e),
+    })?;
+
+    Ok((StatusCode::CREATED, "User registered"))
 }
 
 pub async fn login(
-    Extension(state): Extension<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<LoginRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, AppError> {
     let user = sqlx::query_as::<_, UserRecord>(
         "SELECT id, password_hash FROM users WHERE email = $1"
     )
     .bind(&payload.email)
     .fetch_optional(&state.db)
-    .await;
+    .await?;
 
     match user {
-        Ok(Some(user)) => {
-            if verify(payload.password, &user.password_hash).unwrap_or(false) {
-                let token = generate_jwt(user.id, &state.jwt_secret);
-                (StatusCode::OK, Json(AuthResponse { token })).into_response()
+        Some(user) => {
+            if verify(&payload.password, &user.password_hash).unwrap_or(false) {
+                let token = generate_jwt(user.id, &state.config.jwt_secret);
+                Ok(Json(AuthResponse { token }).into_response())
             } else {
-                (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
+                Err(AppError::Unauthorized("Invalid credentials".into()))
             }
         }
-        _ => (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response(),
+        None => Err(AppError::Unauthorized("Invalid credentials".into())),
     }
 }
 

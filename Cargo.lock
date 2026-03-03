@@ -2458,6 +2458,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dotenvy",
+ "hex",
  "jsonwebtoken",
  "reqwest",
  "rust_decimal",
